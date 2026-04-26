@@ -41,6 +41,10 @@ export class InstructionService {
       
       Analyze the parts (number of parts, their sizes) and generate logical assembly steps.
       Assume basic connectors like screws and dowels.
+      Every step MUST contain a non-empty "description" in plain language (at least 12 characters).
+      Do not use placeholders like "step 1" or generic empty wording.
+      Use only part IDs that exist in the provided metadata.
+      Return at least 3 steps when the model has 4 or more parts.
       
       Respond ONLY with a valid JSON matching this schema:
       {
@@ -71,7 +75,8 @@ export class InstructionService {
             messages: [
               { role: 'user', content: prompt }
             ],
-            response_format: { type: 'json_object' }
+            response_format: { type: 'json_object' },
+            temperature: 0.2
           }),
           signal: controller.signal,
         });
@@ -93,18 +98,12 @@ export class InstructionService {
         throw new Error(`Invalid response from OpenRouter: ${JSON.stringify(result)}`);
       }
 
-      let content = result.choices[0].message.content;
-      this.logger.log(`OpenRouter raw response: ${content}`);
+      const rawContent = this.extractAssistantContent(result);
+      this.logger.log(`OpenRouter raw response: ${rawContent}`);
 
-      if (content.startsWith('```json')) {
-        content = content.replace(/^```json\n/, '').replace(/\n```$/, '');
-      } else if (content.startsWith('```')) {
-        content = content.replace(/^```\n/, '').replace(/\n```$/, '');
-      }
-
-      const parsedContent = JSON.parse(content);
+      const parsedContent = this.parseInstructionsPayload(rawContent);
       this.logger.log(`OpenRouter response parsed successfully.`);
-      return parsedContent;
+      return this.normalizeInstructions(parsedContent, partsData);
 
     } catch (error: any) {
       this.logger.error(`Failed to generate instructions: ${error.message}`);
@@ -142,5 +141,177 @@ export class InstructionService {
     }
 
     return { steps };
+  }
+
+  private extractAssistantContent(result: any): string {
+    const message = result?.choices?.[0]?.message;
+    const content = message?.content;
+
+    if (typeof content === 'string') {
+      return content;
+    }
+
+    if (Array.isArray(content)) {
+      const text = content
+        .map((item: any) => {
+          if (typeof item === 'string') {
+            return item;
+          }
+          if (item?.type === 'text' && typeof item?.text === 'string') {
+            return item.text;
+          }
+          return '';
+        })
+        .join('\n')
+        .trim();
+
+      if (text) {
+        return text;
+      }
+    }
+
+    throw new Error(`OpenRouter response has empty assistant content: ${JSON.stringify(result?.choices?.[0])}`);
+  }
+
+  private parseInstructionsPayload(content: string): any {
+    const trimmed = content.trim();
+    const withoutFence = trimmed
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+
+    try {
+      return JSON.parse(withoutFence);
+    } catch {
+      const firstBrace = withoutFence.indexOf('{');
+      const lastBrace = withoutFence.lastIndexOf('}');
+
+      if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+        throw new Error(`Could not locate JSON object in model output: ${withoutFence}`);
+      }
+
+      const jsonSlice = withoutFence.slice(firstBrace, lastBrace + 1);
+      return JSON.parse(jsonSlice);
+    }
+  }
+
+  private normalizeInstructions(candidate: any, partsData: any): AssemblyInstructions {
+    const rawSteps = this.extractStepsArray(candidate);
+    if (!rawSteps) {
+      this.logger.warn('Model output missing valid steps array. Falling back to mock instructions.');
+      return this.getMockInstructions(partsData);
+    }
+
+    const partIds = new Set<number>(
+      (partsData?.parts ?? [])
+        .map((part: any) => Number(part?.id))
+        .filter((id: number) => Number.isInteger(id))
+    );
+
+    const normalizedSteps: AssemblyStep[] = rawSteps
+      .map((step: any, index: number): AssemblyStep | null => {
+        const rawInvolved = Array.isArray(step?.partsInvolved) ? step.partsInvolved : [];
+        const partsInvolved = rawInvolved
+          .map((value: any) => Number(value))
+          .filter((id: number) => Number.isInteger(id))
+          .filter((id: number) => partIds.size === 0 || partIds.has(id));
+
+        const description = this.extractStepDescription(step, partsInvolved);
+        if (!description.trim()) {
+          return null;
+        }
+
+        return {
+          stepNumber: index + 1,
+          description: description.trim(),
+          partsInvolved
+        };
+      })
+      .filter((step: AssemblyStep | null): step is AssemblyStep => Boolean(step));
+
+    if (normalizedSteps.length === 0) {
+      this.logger.warn('Model output contained only empty steps. Falling back to mock instructions.');
+      return this.getMockInstructions(partsData);
+    }
+
+    if (this.isLowQualityInstructions(normalizedSteps, partsData)) {
+      this.logger.warn('Model output quality is too low. Falling back to mock instructions.');
+      return this.getMockInstructions(partsData);
+    }
+
+    return { steps: normalizedSteps };
+  }
+
+  private extractStepsArray(candidate: any): any[] | null {
+    if (!candidate || typeof candidate !== 'object') {
+      return null;
+    }
+
+    if (Array.isArray(candidate.steps)) {
+      return candidate.steps;
+    }
+
+    if (Array.isArray(candidate.instructions)) {
+      return candidate.instructions;
+    }
+
+    if (Array.isArray(candidate.plan)) {
+      return candidate.plan;
+    }
+
+    if (Array.isArray(candidate.data?.steps)) {
+      return candidate.data.steps;
+    }
+
+    return null;
+  }
+
+  private extractStepDescription(step: any, partsInvolved: number[]): string {
+    const directCandidates = [
+      step?.description,
+      step?.instruction,
+      step?.text,
+      step?.title,
+      step?.summary
+    ];
+
+    for (const candidate of directCandidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+
+    if (Array.isArray(step?.actions)) {
+      const actionText = step.actions
+        .filter((value: any) => typeof value === 'string')
+        .join('. ')
+        .trim();
+      if (actionText) {
+        return actionText;
+      }
+    }
+
+    if (partsInvolved.length > 0) {
+      const partLabels = partsInvolved.map((id) => `Part #${id + 1}`).join(' and ');
+      return `Connect ${partLabels}.`;
+    }
+
+    return '';
+  }
+
+  private isLowQualityInstructions(steps: AssemblyStep[], partsData: any): boolean {
+    const partsCount = Array.isArray(partsData?.parts) ? partsData.parts.length : 0;
+
+    if (steps.length === 1 && partsCount > 2) {
+      return true;
+    }
+
+    const placeholderPattern = /(according to step|step\s+\d+|assemble components)/i;
+    const meaningfulSteps = steps.filter(
+      (step) => step.description.trim().length >= 12 && !placeholderPattern.test(step.description)
+    );
+
+    return meaningfulSteps.length === 0;
   }
 }
