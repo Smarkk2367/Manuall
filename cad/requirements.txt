@@ -1,0 +1,7 @@
+cadquery
+ocp
+flask
+gunicorn
+#For .gltf/.glb export
+trimesh
+scipy
