@@ -34,76 +34,13 @@ export class InstructionService {
 
     this.logger.log('Calling OpenRouter API for instruction generation...');
 
-    const prompt = `
-      You are an expert technical writer for IKEA assembly instructions.
-      I have a furniture CAD model with the following parts metadata:
-      ${JSON.stringify(partsData.parts, null, 2)}
-      
-      Analyze the parts (number of parts, their sizes) and generate logical assembly steps.
-      Assume basic connectors like screws and dowels.
-      Every step MUST contain a non-empty "description" in plain language (at least 12 characters).
-      Do not use placeholders like "step 1" or generic empty wording.
-      Use only part IDs that exist in the provided metadata.
-      Return at least 3 steps when the model has 4 or more parts.
-      
-      Respond ONLY with a valid JSON matching this schema:
-      {
-        "steps": [
-          {
-            "stepNumber": 1,
-            "description": "Short, clear instruction",
-            "partsInvolved": [0, 1] // array of part IDs
-          }
-        ]
-      }
-    `;
-
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000); //30s timeout
-
-      let response: Response;
-      try {
-        response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'nvidia/nemotron-3-super-120b-a12b:free',
-            messages: [
-              { role: 'user', content: prompt }
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0.2
-          }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timeout);
+      const generated = await this.generateWithRetries(partsData, apiKey);
+      if (generated) {
+        return generated;
       }
-
-      const result = await response.json();
-
-      if (result.error) {
-        throw new Error(`OpenRouter provider error: ${result.error.message} (code: ${result.error.code})`);
-      }
-
-      if (!response.ok) {
-        throw new Error(`OpenRouter API error: ${response.status} ${response.statusText}`);
-      }
-
-      if (!result.choices || result.choices.length === 0) {
-        throw new Error(`Invalid response from OpenRouter: ${JSON.stringify(result)}`);
-      }
-
-      const rawContent = this.extractAssistantContent(result);
-      this.logger.log(`OpenRouter raw response: ${rawContent}`);
-
-      const parsedContent = this.parseInstructionsPayload(rawContent);
-      this.logger.log(`OpenRouter response parsed successfully.`);
-      return this.normalizeInstructions(parsedContent, partsData);
+      this.logger.warn('All OpenRouter attempts failed or returned low quality output. Using mocked AI instructions.');
+      return this.getMockInstructions(partsData);
 
     } catch (error: any) {
       this.logger.error(`Failed to generate instructions: ${error.message}`);
@@ -160,6 +97,9 @@ export class InstructionService {
           if (item?.type === 'text' && typeof item?.text === 'string') {
             return item.text;
           }
+          if (typeof item?.content === 'string') {
+            return item.content;
+          }
           return '';
         })
         .join('\n')
@@ -168,6 +108,10 @@ export class InstructionService {
       if (text) {
         return text;
       }
+    }
+
+    if (typeof result?.choices?.[0]?.text === 'string' && result.choices[0].text.trim()) {
+      return result.choices[0].text.trim();
     }
 
     throw new Error(`OpenRouter response has empty assistant content: ${JSON.stringify(result?.choices?.[0])}`);
@@ -196,11 +140,10 @@ export class InstructionService {
     }
   }
 
-  private normalizeInstructions(candidate: any, partsData: any): AssemblyInstructions {
+  private normalizeInstructions(candidate: any, partsData: any): AssemblyInstructions | null {
     const rawSteps = this.extractStepsArray(candidate);
     if (!rawSteps) {
-      this.logger.warn('Model output missing valid steps array. Falling back to mock instructions.');
-      return this.getMockInstructions(partsData);
+      return null;
     }
 
     const partIds = new Set<number>(
@@ -231,13 +174,11 @@ export class InstructionService {
       .filter((step: AssemblyStep | null): step is AssemblyStep => Boolean(step));
 
     if (normalizedSteps.length === 0) {
-      this.logger.warn('Model output contained only empty steps. Falling back to mock instructions.');
-      return this.getMockInstructions(partsData);
+      return null;
     }
 
     if (this.isLowQualityInstructions(normalizedSteps, partsData)) {
-      this.logger.warn('Model output quality is too low. Falling back to mock instructions.');
-      return this.getMockInstructions(partsData);
+      return null;
     }
 
     return { steps: normalizedSteps };
@@ -313,5 +254,122 @@ export class InstructionService {
     );
 
     return meaningfulSteps.length === 0;
+  }
+
+  private async generateWithRetries(partsData: any, apiKey: string): Promise<AssemblyInstructions | null> {
+    const configuredModels = process.env.OPENROUTER_MODELS
+      ? process.env.OPENROUTER_MODELS.split(',').map((model) => model.trim()).filter(Boolean)
+      : [];
+    const freeConfiguredModels = configuredModels.filter((model) => model.endsWith(':free'));
+    const models = freeConfiguredModels.length > 0
+      ? freeConfiguredModels
+      : [
+        'nvidia/nemotron-3-super-120b-a12b:free'
+      ];
+
+    if (configuredModels.length > 0 && freeConfiguredModels.length === 0) {
+      this.logger.warn('OPENROUTER_MODELS contains no free models. Falling back to default free model list.');
+    }
+
+    for (const model of models) {
+      for (const strictJson of [true, false]) {
+        try {
+          const prompt = this.buildPrompt(partsData, strictJson);
+          const result = await this.callOpenRouter(apiKey, model, prompt, strictJson);
+          const rawContent = this.extractAssistantContent(result);
+          this.logger.log(`OpenRouter raw response (${model}, strict=${strictJson}): ${rawContent}`);
+
+          const parsedContent = this.parseInstructionsPayload(rawContent);
+          const normalized = this.normalizeInstructions(parsedContent, partsData);
+          if (normalized) {
+            this.logger.log(`OpenRouter response accepted (${model}, strict=${strictJson}).`);
+            return normalized;
+          }
+
+          this.logger.warn(`OpenRouter response rejected as low-quality (${model}, strict=${strictJson}).`);
+        } catch (error: any) {
+          this.logger.warn(`OpenRouter attempt failed (${model}, strict=${strictJson}): ${error.message}`);
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private buildPrompt(partsData: any, strictJson: boolean): string {
+    const common = `
+You are an expert technical writer for IKEA-style assembly instructions.
+Use this parts metadata:
+${JSON.stringify(partsData.parts, null, 2)}
+
+Generate assembly steps in logical order.
+Rules:
+- every step must contain a concrete non-empty description (min 12 chars),
+- do not output placeholders like "step 1" or generic filler,
+- use only part IDs from provided metadata,
+- if there are 4+ parts, produce at least 3 steps.
+`;
+
+    if (strictJson) {
+      return `${common}
+Respond ONLY with valid JSON:
+{
+  "steps": [
+    {
+      "stepNumber": 1,
+      "description": "Short, concrete assembly instruction",
+      "partsInvolved": [0, 1]
+    }
+  ]
+}`;
+    }
+
+    return `${common}
+Return JSON object with key "steps".`;
+  }
+
+  private async callOpenRouter(apiKey: string, model: string, prompt: string, strictJson: boolean): Promise<any> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
+
+    try {
+      const body: any = {
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2
+      };
+
+      if (strictJson) {
+        body.response_format = { type: 'json_object' };
+      }
+
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      const result = await response.json();
+
+      if (result.error) {
+        throw new Error(`OpenRouter provider error: ${result.error.message} (code: ${result.error.code})`);
+      }
+
+      if (!response.ok) {
+        throw new Error(`OpenRouter API error: ${response.status} ${response.statusText}`);
+      }
+
+      if (!result.choices || result.choices.length === 0) {
+        throw new Error(`Invalid response from OpenRouter: ${JSON.stringify(result)}`);
+      }
+
+      return result;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
