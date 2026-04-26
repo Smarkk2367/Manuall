@@ -5,10 +5,17 @@ import {
   UploadedFile,
   ParseFilePipe,
   MaxFileSizeValidator,
+  Get,
+  Param,
+  Res,
+  NotFoundException
 } from '@nestjs/common';
+import * as express from 'express';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import { v4 as uuidv4 } from 'uuid';
+import * as path from 'path';
+import * as fs from 'fs';
 import { extname } from 'path';
 import { StepService } from './step.service';
 
@@ -40,7 +47,6 @@ export class StepController {
   ) {
     const jobId = uuidv4();
 
-    //SSE simulation for now
     this.stepService.processStepFile(jobId, file);
 
     return {
@@ -48,6 +54,15 @@ export class StepController {
       jobId,
       filename: file.filename,
     };
+  }
+
+  @Get('file/:filename')
+  async getFile(@Param('filename') filename: string, @Res() res: express.Response) {
+    const filePath = path.join(process.cwd(), 'uploads', filename);
+    if (!fs.existsSync(filePath)) {
+      throw new NotFoundException('File not found');
+    }
+    res.sendFile(filePath);
   }
 }
 
