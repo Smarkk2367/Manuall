@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import UploadForm from "@/components/UploadForm";
 import ProgressBar from "@/components/ProgressBar";
-import ModelViewer from "@/components/ModelViewer";
+import ModelViewer, { ModelViewerHandle } from "@/components/ModelViewer";
 import PartGallery from "@/components/PartGallery";
 import InstructionStepper from "@/components/InstructionStepper";
 
@@ -12,6 +12,7 @@ export default function Home() {
   const [resultFile, setResultFile] = useState<string | null>(null);
   const [partsFile, setPartsFile] = useState<string | null>(null);
   const [instructionsFile, setInstructionsFile] = useState<string | null>(null);
+  const modelViewerRef = useRef<ModelViewerHandle>(null);
 
   const handleUploadSuccess = (id: string) => {
     setJobId(id);
@@ -21,6 +22,10 @@ export default function Home() {
     setResultFile(filename);
     setPartsFile(partsFilename);
     setInstructionsFile(instructionsFilename);
+  };
+
+  const getModelSnapshot = () => {
+    return modelViewerRef.current?.captureSnapshot() ?? null;
   };
 
   return (
@@ -43,13 +48,17 @@ export default function Home() {
       ) : (
         <div className="w-full h-[90vh] flex flex-col md:flex-row gap-6 max-w-[1600px] mx-auto">
           <div className="flex-1 bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden relative">
-            <ModelViewer resultFile={resultFile} />
+            <ModelViewer ref={modelViewerRef} resultFile={resultFile} />
           </div>
 
           <div className="w-full md:w-[400px] lg:w-[450px] flex flex-col gap-6">
             {instructionsFile && partsFile && (
               <div className="flex-1 bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden flex flex-col">
-                <InstructionStepper instructionsFile={instructionsFile} partsFile={partsFile} />
+                <InstructionStepper
+                  instructionsFile={instructionsFile}
+                  partsFile={partsFile}
+                  getModelSnapshot={getModelSnapshot}
+                />
               </div>
             )}
 
@@ -69,3 +78,4 @@ export default function Home() {
     </main>
   );
 }
+

@@ -1,29 +1,37 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronRight, ChevronLeft, CheckCircle2, Box, Loader2 } from "lucide-react";
+import { ChevronRight, ChevronLeft, CheckCircle2, Box, Loader2, FileDown } from "lucide-react";
+import { exportToPDF } from "@/lib/pdfExport";
 
 interface PartData {
   id: number;
   svg: string;
+  bounds: {
+    xlen: number;
+    ylen: number;
+    zlen: number;
+  };
 }
 
 interface AssemblyStep {
   stepNumber: number;
   description: string;
-  partsInvolved: number[];
+  partsInvolved?: number[];
 }
 
 interface InstructionStepperProps {
   instructionsFile: string;
   partsFile: string;
+  getModelSnapshot?: () => string | null;
 }
 
-export default function InstructionStepper({ instructionsFile, partsFile }: InstructionStepperProps) {
+export default function InstructionStepper({ instructionsFile, partsFile, getModelSnapshot }: InstructionStepperProps) {
   const [steps, setSteps] = useState<AssemblyStep[] | null>(null);
   const [parts, setParts] = useState<PartData[] | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -86,6 +94,22 @@ export default function InstructionStepper({ instructionsFile, partsFile }: Inst
     }
   };
 
+  const handleExportPDF = async () => {
+    if (!parts || !steps) return;
+    setExporting(true);
+    try {
+      const snapshot = getModelSnapshot ? getModelSnapshot() : null;
+      await exportToPDF({
+        productName: "FURNITURE",
+        parts,
+        steps,
+        modelSnapshotDataUrl: snapshot,
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full bg-white">
       <div className="p-5 border-b border-gray-100 flex items-center justify-between bg-white">
@@ -93,8 +117,21 @@ export default function InstructionStepper({ instructionsFile, partsFile }: Inst
           <h2 className="text-xl font-bold text-gray-900 tracking-tight">Assembly Guide</h2>
           <p className="text-sm text-gray-500 mt-1">Step {currentStepIndex + 1} of {steps.length}</p>
         </div>
-        <div className="flex items-center justify-center w-12 h-12 rounded-full border-4 border-blue-100">
-          <span className="font-bold text-lg text-blue-600">{currentStepIndex + 1}</span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleExportPDF}
+            disabled={exporting}
+            title="Export to PDF"
+            className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium text-gray-600 hover:bg-gray-100 border border-gray-200 disabled:opacity-50 transition-colors"
+          >
+            {exporting
+              ? <Loader2 className="w-4 h-4 animate-spin" />
+              : <FileDown className="w-4 h-4" />}
+            {exporting ? "Exporting..." : "PDF"}
+          </button>
+          <div className="flex items-center justify-center w-12 h-12 rounded-full border-4 border-blue-100">
+            <span className="font-bold text-lg text-blue-600">{currentStepIndex + 1}</span>
+          </div>
         </div>
       </div>
 
